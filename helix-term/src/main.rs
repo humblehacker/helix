@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use anyhow::{Context, Error, Result};
 use crossterm::event::EventStream;
 use helix_loader::VERSION_AND_GIT_HASH;
@@ -66,6 +67,8 @@ FLAGS:
     -V, --version                  Prints version information
     --vsplit                       Splits all given files vertically into different windows
     --hsplit                       Splits all given files horizontally into different windows
+    --ipc-input <pipe path>        Path to IPC input pipe
+    --ipc-output <pipe path>       Path to IPC output pipe
 ",
         env!("CARGO_PKG_NAME"),
         VERSION_AND_GIT_HASH,
@@ -110,6 +113,18 @@ FLAGS:
     if args.build_grammars {
         helix_loader::grammar::build_grammars(None)?;
         return Ok(0);
+    }
+
+    match (args.ipc_input.clone(), args.ipc_output.clone()) {
+        (Some(input), Some(output)) if input == output => {
+            eprintln!("--ipc-input and --ipc-output can't point to the same pipe");
+            std::process::exit(1);
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("--ipc-input and --ipc-output must be specified together or not at all");
+            std::process::exit(1);
+        },
+        _ => {}
     }
 
     setup_logging(args.verbosity).context("failed to initialize logging")?;

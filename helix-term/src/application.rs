@@ -1,5 +1,5 @@
 use arc_swap::{access::Map, ArcSwap};
-use futures_util::Stream;
+use futures_util::{Stream, stream};
 use helix_core::{
     diagnostic::{DiagnosticTag, NumberOrString},
     path::get_relative_path,
@@ -30,6 +30,7 @@ use crate::{
     job::Jobs,
     keymap::Keymaps,
     ui::{self, overlay::overlaid},
+    ipc,
 };
 
 use log::{debug, error, warn};
@@ -39,12 +40,18 @@ use std::{
     path::Path,
     sync::Arc,
 };
+use std::io::Read;
+use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::{Context, Error};
 
 use crossterm::{event::Event as CrosstermEvent, tty::IsTty};
+use tokio::io::AsyncBufReadExt;
 #[cfg(not(windows))]
 use {signal_hook::consts::signal, signal_hook_tokio::Signals};
+use helix_view::editor::Action;
+
 #[cfg(windows)]
 type Signals = futures_util::stream::Empty<()>;
 
@@ -77,6 +84,7 @@ pub struct Application {
     signals: Signals,
     jobs: Jobs,
     lsp_progress: LspProgressMap,
+    ipc_stream: Pin<Box<dyn Stream<Item=Result<String, std::io::Error>> + Send>>,
 }
 
 #[cfg(feature = "integration")]
@@ -173,7 +181,7 @@ impl Application {
                 compositor.push(Box::new(overlaid(picker)));
             } else {
                 let nr_of_files = args.files.len();
-                for (i, (file, pos)) in args.files.into_iter().enumerate() {
+                for (i, (file, pos)) in args.files.clone().into_iter().enumerate() {
                     if file.is_dir() {
                         return Err(anyhow::anyhow!(
                             "expected a path to file, found a directory. (to open a directory pass it as first argument)"
@@ -248,6 +256,11 @@ impl Application {
             signals,
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
+            ipc_stream: if let Some(ipc_input) = args.ipc_input {
+                Box::pin(ipc::ipc_stream(ipc_input.clone()))
+            } else {
+                Box::pin(stream::empty())
+            }
         };
 
         Ok(app)
@@ -316,6 +329,12 @@ impl Application {
             tokio::select! {
                 biased;
 
+                Some(ipc_result) = self.ipc_stream.next() => {
+                    if !self.handle_ipc(ipc_result).await {
+                        return false;
+                    };
+                    self.render().await;
+                }
                 Some(signal) = self.signals.next() => {
                     if !self.handle_signals(signal).await {
                         return false;
@@ -439,6 +458,58 @@ impl Application {
                 self.editor.set_error(err.to_string());
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub async fn handle_ipc(&mut self, ipc_result: Result<String, std::io::Error>) -> bool {
+        true
+    }
+
+    #[cfg(not(windows))]
+    pub async fn handle_ipc(&mut self, ipc_result: Result<String, std::io::Error>) -> bool {
+        match ipc_result {
+            Ok(message) => {
+                if !self.handle_ipc_message(message).await {
+                    return false;
+                };
+            }
+            Err(err) => {
+                self.editor.set_error(format!("IPC error: {}", err));
+            }
+        }
+        true
+    }
+
+    async fn handle_ipc_message(&mut self, message: String) -> bool {
+        self.editor.set_status(format!("ipc message: {}", message));
+        if message.is_empty() { return true; }
+
+        let parts: Vec<&str> = message.split(":").collect();
+        let command = parts[0];
+        let rest = &parts[1..];
+
+        self.handle_ipc_command(command, rest)
+    }
+
+    fn handle_ipc_command(&mut self, command: &str, rest: &[&str]) -> bool {
+        match command {
+            "openFile" => {
+                let path = PathBuf::from(rest[0]);
+                match self.editor.open(&path, Action::Replace) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.editor.set_error(format!(
+                            "Failed to open file '{}': {}",
+                            path.display(),
+                            e
+                        ));
+                    }
+                }
+            }
+            "exit" => return false,
+            _ => self.editor.set_error(format!("unknown command {}", command)),
+        }
+        true
     }
 
     #[cfg(windows)]

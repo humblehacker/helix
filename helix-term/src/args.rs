@@ -17,6 +17,8 @@ pub struct Args {
     pub log_file: Option<PathBuf>,
     pub config_file: Option<PathBuf>,
     pub files: Vec<(PathBuf, Position)>,
+    pub ipc_input: Option<PathBuf>,
+    pub ipc_output: Option<PathBuf>
 }
 
 impl Args {
@@ -59,6 +61,14 @@ impl Args {
                     Some(path) => args.log_file = Some(path.into()),
                     None => anyhow::bail!("--log must specify a path to write"),
                 },
+                "--ipc-input" => match argv.next().as_deref() {
+                    Some(path) => args.ipc_input = Some(path.into()),
+                    None => anyhow::bail!("--ipc-input must specify a path to a named pipe"),
+                },
+                "--ipc-output" => match argv.next().as_deref() {
+                    Some(path) => args.ipc_output = Some(path.into()),
+                    None => anyhow::bail!("--ipc-output must specify a path to a named pipe"),
+                }
                 arg if arg.starts_with("--") => {
                     anyhow::bail!("unexpected double dash argument: {}", arg)
                 }

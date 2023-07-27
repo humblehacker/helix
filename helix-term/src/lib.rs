@@ -10,6 +10,8 @@ pub mod health;
 pub mod job;
 pub mod keymap;
 pub mod ui;
+mod ipc;
+
 use std::path::Path;
 
 use ignore::DirEntry;
