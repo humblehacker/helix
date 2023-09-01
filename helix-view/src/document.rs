@@ -33,7 +33,7 @@ use helix_core::{
     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
 };
 
-use crate::editor::{Config, RedrawHandle};
+use crate::editor::Config;
 use crate::{DocumentId, Editor, Theme, View, ViewId};
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
@@ -185,6 +185,8 @@ pub struct Document {
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
+
+    pub readonly: bool,
 }
 
 /// Inlay hints for a single `(Document, View)` combo.
@@ -673,6 +675,7 @@ impl Document {
             config,
             version_control_head: None,
             focused_at: std::time::Instant::now(),
+            readonly: false,
         }
     }
 
@@ -705,7 +708,7 @@ impl Document {
         let mut doc = Self::from(rope, Some((encoding, has_bom)), config);
 
         // set the path and try detecting the language
-        doc.set_path(Some(path))?;
+        doc.set_path(Some(path));
         if let Some(loader) = config_loader {
             doc.detect_language(loader);
         }
@@ -730,16 +733,16 @@ impl Document {
     // We can't use anyhow::Result here since the output of the future has to be
     // clonable to be used as shared future. So use a custom error type.
     pub fn format(&self) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
-        if let Some(formatter) = self
+        if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
-            .and_then(|c| c.formatter.clone())
-            .filter(|formatter| which::which(&formatter.command).is_ok())
+            .and_then(|c| c.formatter.as_ref())
+            .and_then(|formatter| Some((which::which(&formatter.command).ok()?, &formatter.args)))
         {
             use std::process::Stdio;
             let text = self.text().clone();
-            let mut process = tokio::process::Command::new(&formatter.command);
+            let mut process = tokio::process::Command::new(&fmt_cmd);
             process
-                .args(&formatter.args)
+                .args(fmt_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -748,7 +751,7 @@ impl Document {
                 let mut process = process
                     .spawn()
                     .map_err(|e| FormatterError::SpawningFailed {
-                        command: formatter.command.clone(),
+                        command: fmt_cmd.to_string_lossy().into(),
                         error: e.kind(),
                     })?;
                 {
@@ -850,7 +853,7 @@ impl Document {
         let text = self.text().clone();
 
         let path = match path {
-            Some(path) => helix_core::path::get_canonicalized_path(&path)?,
+            Some(path) => helix_core::path::get_canonicalized_path(&path),
             None => {
                 if self.path.is_none() {
                     bail!("Can't save with no path set!");
@@ -955,12 +958,43 @@ impl Document {
         }
     }
 
+    #[cfg(unix)]
+    // Detect if the file is readonly and change the readonly field if necessary (unix only)
+    pub fn detect_readonly(&mut self) {
+        use rustix::fs::{access, Access};
+        // Allows setting the flag for files the user cannot modify, like root files
+        self.readonly = match &self.path {
+            None => false,
+            Some(p) => match access(p, Access::WRITE_OK) {
+                Ok(_) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            },
+        };
+    }
+
+    #[cfg(not(unix))]
+    // Detect if the file is readonly and change the readonly field if necessary (non-unix os)
+    pub fn detect_readonly(&mut self) {
+        // TODO Use the Windows' function `CreateFileW` to check if a file is readonly
+        // Discussion: https://github.com/helix-editor/helix/pull/7740#issuecomment-1656806459
+        // Vim implementation: https://github.com/vim/vim/blob/4c0089d696b8d1d5dc40568f25ea5738fa5bbffb/src/os_win32.c#L7665
+        // Windows binding: https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Storage/FileSystem/fn.CreateFileW.html
+        self.readonly = match &self.path {
+            None => false,
+            Some(p) => match std::fs::metadata(p) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => false,
+                Ok(metadata) => metadata.permissions().readonly(),
+            },
+        };
+    }
+
     /// Reload the document from its path.
     pub fn reload(
         &mut self,
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
-        redraw_handle: RedrawHandle,
     ) -> Result<(), Error> {
         let encoding = self.encoding;
         let path = self
@@ -968,6 +1002,9 @@ impl Document {
             .filter(|path| path.exists())
             .ok_or_else(|| anyhow!("can't find file to reload from {:?}", self.display_name()))?
             .to_owned();
+
+        // Once we have a valid path we check if its readonly status has changed
+        self.detect_readonly();
 
         let mut file = std::fs::File::open(&path)?;
         let (rope, ..) = from_reader(&mut file, Some(encoding))?;
@@ -985,7 +1022,7 @@ impl Document {
         self.detect_indent_and_line_ending();
 
         match provider_registry.get_diff_base(&path) {
-            Some(diff_base) => self.set_diff_base(diff_base, redraw_handle),
+            Some(diff_base) => self.set_diff_base(diff_base),
             None => self.diff_handle = None,
         }
 
@@ -1009,16 +1046,14 @@ impl Document {
         self.encoding
     }
 
-    pub fn set_path(&mut self, path: Option<&Path>) -> Result<(), std::io::Error> {
-        let path = path
-            .map(helix_core::path::get_canonicalized_path)
-            .transpose()?;
+    pub fn set_path(&mut self, path: Option<&Path>) {
+        let path = path.map(helix_core::path::get_canonicalized_path);
 
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
         self.path = path;
 
-        Ok(())
+        self.detect_readonly();
     }
 
     /// Set the programming language for the file and load associated data (e.g. highlighting)
@@ -1547,13 +1582,13 @@ impl Document {
     }
 
     /// Intialize/updates the differ for this document with a new base.
-    pub fn set_diff_base(&mut self, diff_base: Vec<u8>, redraw_handle: RedrawHandle) {
+    pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
             if let Some(differ) = &self.diff_handle {
                 differ.update_diff_base(diff_base);
                 return;
             }
-            self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone(), redraw_handle))
+            self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()))
         } else {
             self.diff_handle = None;
         }
